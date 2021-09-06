@@ -4,7 +4,7 @@
 import logging
 import os
 import time
-from functools import reduce
+from functools import reduce, partial
 
 import numpy as np
 import xarray as xr
@@ -28,14 +28,17 @@ def to_int_str(da, nonnans=None):
 
 def join_str_arrays(arraylist):
     """Join string array together (elementwise concatenation of strings)."""
-    func = lambda *l: np.add(*l, dtype=object)  # np.core.defchararray.add
+    func = partial(np.add, dtype=object)  # np.core.defchararray.add
     return reduce(func, arraylist, "")
 
 
 def str_array_to_file(array, fn):
     """Elementwise writing out string values to a file."""
+    # TODO try to find out if we are possibly creating race conditions here!!!
+    # the writing order of each chunk might be random if called from multiple
+    # processes
     return xr.apply_ufunc(
-        lambda x: fn.write(x),
+        fn.write,
         array,
         dask="parallelized",
         vectorize=True,
@@ -64,12 +67,14 @@ def constraints_to_file(m, f):
     sign = m.constraints_sign
     rhs = m.constraints_rhs
 
+    term_names = [f"{n}_term" for n in con]
+
     nonnans = coef.notnull() & var.notnull()
     join = [to_float_str(coef), " x", to_int_str(var), "\n"]
-    lhs_str = join_str_arrays(join).where(nonnans, "").reduce(np.sum, "_term")
+    lhs_str = join_str_arrays(join).where(nonnans, "").reduce(np.sum, term_names)
     # .sum() does not work
 
-    nonnans = nonnans.any("_term") & con.notnull() & sign.notnull() & rhs.notnull()
+    nonnans = nonnans.any(term_names) & con.notnull() & sign.notnull() & rhs.notnull()
 
     join = [
         "c",
@@ -112,17 +117,16 @@ def to_file(m, fn):
     if os.path.exists(fn):
         os.remove(fn)  # ensure a clear file
 
-    f = open(fn, mode="w")
+    with open(fn, mode="w") as f:
 
-    start = time.time()
+        start = time.time()
 
-    objective_to_file(m, f)
-    constraints_to_file(m, f)
-    bounds_to_file(m, f)
-    binaries_to_file(m, f)
+        objective_to_file(m, f)
+        constraints_to_file(m, f)
+        bounds_to_file(m, f)
+        binaries_to_file(m, f)
 
-    f.close()
-    logger.info(f" Writing time: {round(time.time()-start, 2)}s")
+        logger.info(f" Writing time: {round(time.time()-start, 2)}s")
 
 
 all_ds_attrs = [
@@ -195,6 +199,6 @@ def read_netcdf(path, **kwargs):
     m.objective = LinearExpression(m.objective)
 
     for k in all_obj_attrs:
-        setattr(m, k, ds.attrs.pop(k))
+        setattr(m, k, all_ds.attrs.pop(k))
 
     return m

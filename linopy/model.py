@@ -6,7 +6,7 @@ This module contains frontend implementations of the package.
 
 import logging
 import os
-from tempfile import gettempdir, mkstemp
+from tempfile import NamedTemporaryFile, gettempdir
 
 import numpy as np
 import pandas as pd
@@ -14,15 +14,9 @@ import xarray as xr
 from numpy import inf
 from xarray import DataArray, Dataset, merge
 
+from . import solvers
 from .io import to_file, to_netcdf
-from .solvers import (
-    available_solvers,
-    run_cbc,
-    run_cplex,
-    run_glpk,
-    run_gurobi,
-    run_xpress,
-)
+from .solvers import available_solvers
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +259,8 @@ class Model:
         con = DataArray(con, coords=broadcasted.coords)
         con = con.assign_attrs(name=name)
 
+        lhs = lhs.rename({"_term": f"{name}_term"})
+
         if self.chunk:
             lhs = lhs.chunk(self.chunk)
             sign = sign.chunk(self.chunk)
@@ -315,9 +311,7 @@ class Model:
         """
         Remove all variables stored under reference name `name` from the model.
 
-        This function also removes the variables from constraints and the
-        objective function. Note that this will leave blank spaces where the
-        variables were stored which ensures dimensional compatibility.
+        This function removes all constraints where the variable was used.
 
         Parameters
         ----------
@@ -335,16 +329,15 @@ class Model:
         self.variables_lower_bound = self.variables_lower_bound.drop_vars(name)
         self.variables_upper_bound = self.variables_upper_bound.drop_vars(name)
 
-        keep_b = ~self.constraints_lhs_vars.isin(labels)
-        self.constraints_lhs_coeffs = self.constraints_lhs_coeffs.where(keep_b)
-        self.constraints_lhs_vars = self.constraints_lhs_vars.where(keep_b)
+        remove_b = self.constraints_lhs_vars.isin(labels).any()
+        names = [name for name, remove in remove_b.items() if remove.item()]
+        self.constraints_lhs_coeffs = self.constraints_lhs_coeffs.drop_vars(names)
+        self.constraints_lhs_vars = self.constraints_lhs_vars.drop_vars(names)
+        self.constraints = self.constraints.drop_vars(names)
+        self.constraints_sign = self.constraints_sign.drop_vars(names)
+        self.constraints_rhs = self.constraints_rhs.drop_vars(names)
 
-        keep_b_con = keep_b.any(dim="_term")
-        self.constraints = self.constraints.where(keep_b_con)
-        self.constraints_sign = self.constraints_sign.where(keep_b_con)
-        self.constraints_rhs = self.constraints_rhs.where(keep_b_con)
-
-        self.objective = self.objective.where(~self.objective.isin(labels))
+        self.objective = self.objective.sel(_term=~self.objective.vars.isin(labels))
 
     def remove_constraints(self, name):
         """
@@ -484,17 +477,23 @@ class Model:
         logger.info(f" Solve linear problem using {solver_name.title()} solver")
         assert solver_name in available_solvers, f"Solver {solver_name} not installed"
 
-        tmp_kwargs = dict(text=True, dir=self.solver_dir)
+        tmp_kwargs = dict(mode="w", delete=False, dir=self.solver_dir)
         if problem_fn is None:
-            fds, problem_fn = mkstemp(".lp", "linopy-problem-", **tmp_kwargs)
+            with NamedTemporaryFile(
+                suffix=".lp", prefix="linopy-problem-", **tmp_kwargs
+            ) as f:
+                problem_fn = f.name
         if solution_fn is None:
-            fds, solution_fn = mkstemp(".sol", "linopy-solve-", **tmp_kwargs)
+            with NamedTemporaryFile(
+                suffix=".sol", prefix="linopy-solve-", **tmp_kwargs
+            ) as f:
+                solution_fn = f.name
         if log_fn is not None:
             logger.info(f"Solver logs written to `{log_fn}`.")
 
         try:
             self.to_file(problem_fn)
-            solve = eval(f"run_{solver_name}")
+            solve = getattr(solvers, f"run_{solver_name}")
             res = solve(
                 problem_fn,
                 log_fn,
@@ -519,11 +518,11 @@ class Model:
             logger.info(f" Optimization successful. Objective value: {obj:.2e}")
         elif status == "warning" and termination_condition == "suboptimal":
             logger.warning(
-                " Optimization solution is sub-optimal. " "Objective value: {obj:.2e}"
+                f"Optimization solution is sub-optimal. Objective value: {obj:.2e}"
             )
         else:
             logger.warning(
-                f" Optimization failed with status {status} and "
+                f"Optimization failed with status {status} and "
                 f"termination condition {termination_condition}"
             )
             return status, termination_condition
@@ -534,17 +533,17 @@ class Model:
 
         res["solution"].loc[np.nan] = np.nan
         for v in self.variables:
-            idx = self.variables[v].data.ravel()
+            idx = np.ravel(self.variables[v])
             sol = res["solution"][idx].values.reshape(self.variables[v].shape)
             self.solution[v] = xr.DataArray(sol, self.variables[v].coords)
 
         res["dual"].loc[np.nan] = np.nan
         for c in self.constraints:
-            idx = self.constraints[c].data.ravel()
+            idx = np.ravel(self.constraints[c])
             du = res["dual"][idx].values.reshape(self.constraints[c].shape)
             self.dual[c] = xr.DataArray(du, self.constraints[c].coords)
 
-        return self
+        return status, termination_condition
 
     to_netcdf = to_netcdf
 
@@ -762,6 +761,10 @@ class LinearExpression(Dataset):
         if dataset is not None:
             assert set(dataset) == {"coeffs", "vars"}
             (dataset,) = xr.broadcast(dataset)
+            dataset = dataset.transpose(..., "_term")
+        else:
+            dataset = xr.Dataset({"coeffs": DataArray([]), "vars": DataArray([])})
+            dataset = dataset.assign_coords(_term=[])
         super().__init__(dataset)
 
     # We have to set the _reduce_method to None, in order to overwrite basic
@@ -795,8 +798,6 @@ class LinearExpression(Dataset):
                 "unsupported operand type(s) for +: " f"{type(self)} and {type(other)}"
             )
         res = LinearExpression(xr.concat([self, other], dim="_term"))
-        if res.indexes["_term"].duplicated().any():
-            return res.assign_coords(_term=pd.RangeIndex(len(res._term)))
         return res
 
     def __sub__(self, other):
@@ -810,8 +811,6 @@ class LinearExpression(Dataset):
                 "unsupported operand type(s) for -: " f"{type(self)} and {type(other)}"
             )
         res = LinearExpression(xr.concat([self, other], dim="_term"))
-        if res.indexes["_term"].duplicated().any():
-            return res.assign_coords(_term=pd.RangeIndex(len(res._term)))
         return res
 
     def __neg__(self):
@@ -843,9 +842,6 @@ class LinearExpression(Dataset):
         dims : str/list, optional
             Dimension(s) to sum over. The default is None which results in all
             dimensions.
-        keep_coords : bool, optional
-            Whether to keep the coordinates of the stacked dimensions in a
-            MultiIndex. The default is False.
 
         Returns
         -------
@@ -860,16 +856,11 @@ class LinearExpression(Dataset):
         if "_term" in dims:
             dims.remove("_term")
 
-        stacked_term_dim = "term_dim_"
-        num = 0
-        while stacked_term_dim + str(num) in self.indexes["_term"].names:
-            num += 1
-        stacked_term_dim += str(num)
-        dims.append(stacked_term_dim)
-
-        ds = self.rename(_term=stacked_term_dim).stack(_term=dims)
-        if not keep_coords:
-            ds = ds.assign_coords(_term=pd.RangeIndex(len(ds._term)))
+        ds = (
+            self.rename(_term="_stacked_term")
+            .stack(_term=["_stacked_term"] + dims)
+            .reset_index("_term", drop=True)
+        )
         return LinearExpression(ds)
 
     def from_tuples(*tuples, chunk=None):
@@ -903,14 +894,14 @@ class LinearExpression(Dataset):
 
         This is the same as calling ``10*x + y`` but a bit more performant.
         """
-        idx = pd.RangeIndex(len(tuples))
         ds_list = [Dataset({"coeffs": c, "vars": v}) for c, v in tuples]
         if len(ds_list) > 1:
-            ds = xr.concat(ds_list, dim=pd.Index(idx, name="_term"))
+            ds = xr.concat(ds_list, dim="_term")
         else:
-            ds = ds_list[0].expand_dims(_term=idx)
+            ds = ds_list[0].expand_dims("_term")
         return LinearExpression(ds)
 
+    # TODO: remove since covered by expr.groupby(...).sum()
     def group_terms(self, group):
         """
         Sum expression over groups.
@@ -950,4 +941,4 @@ class LinearExpression(Dataset):
 
     def empty(self):
         """Get whether the linear expression is empty."""
-        return not bool(self)
+        return self.shape == (0,)
