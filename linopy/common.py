@@ -260,7 +260,7 @@ def check_has_nulls(df: pd.DataFrame, name: str):
         raise ValueError(f"{name} contains nan's in field(s) {fields}")
 
 
-def infer_schema_polars(ds: pl.DataFrame) -> dict:
+def infer_schema_polars(ds: Dataset, overwrites: dict[str, pl.DataType]) -> dict:
     """
     Infer the schema for a Polars DataFrame based on the data types of its columns.
 
@@ -272,7 +272,9 @@ def infer_schema_polars(ds: pl.DataFrame) -> dict:
     """
     schema = {}
     for col_name, array in ds.items():
-        if np.issubdtype(array.dtype, np.integer):
+        if col_name in overwrites:
+            schema[col_name] = overwrites[col_name]
+        elif np.issubdtype(array.dtype, np.integer):
             schema[col_name] = pl.Int32 if os.name == "nt" else pl.Int64
         elif np.issubdtype(array.dtype, np.floating):
             schema[col_name] = pl.Float64
@@ -301,10 +303,10 @@ def to_polars(ds: Dataset, **kwargs) -> pl.DataFrame:
         DataFrame constructor.
     """
     data = broadcast(ds)[0]
-    return pl.DataFrame({k: v.values.reshape(-1) for k, v in data.items()}, **kwargs)
+    return pl.LazyFrame({k: v.values.reshape(-1) for k, v in data.items()}, **kwargs)
 
 
-def check_has_nulls_polars(df: pl.DataFrame, name: str = "") -> None:
+def check_has_nulls_polars(df: pl.LazyFrame, name: str = "") -> None:
     """
     Checks if the given DataFrame contains any null values and raises a ValueError if it does.
 
@@ -316,7 +318,7 @@ def check_has_nulls_polars(df: pl.DataFrame, name: str = "") -> None:
         ValueError: If the DataFrame contains null values,
         a ValueError is raised with a message indicating the name of the constraint and the fields containing null values.
     """
-    has_nulls = df.select(pl.col("*").is_null().any())
+    has_nulls = df.select(pl.col("*").is_null().any()).collect()
     null_columns = [col for col in has_nulls.columns if has_nulls[col][0]]
     if null_columns:
         raise ValueError(f"{name} contains nan's in field(s) {null_columns}")
@@ -345,7 +347,7 @@ def filter_nulls_polars(df: pl.DataFrame) -> pl.DataFrame:
     return df.filter(cond)
 
 
-def group_terms_polars(df: pl.DataFrame) -> pl.DataFrame:
+def group_terms_polars(df: pl.LazyFrame) -> pl.LazyFrame:
     """
     Groups terms in a polars DataFrame.
 

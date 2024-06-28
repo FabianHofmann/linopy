@@ -578,18 +578,19 @@ class Constraint:
         check_has_nulls_polars(long, name=f"{self.type} {self.name}")
 
         short = ds[[k for k in ds if "_term" not in ds[k].dims]]
-        schema = infer_schema_polars(short)
-        schema["sign"] = pl.Enum(["=", "<=", ">="])
+        schema = infer_schema_polars(
+            short, overwrites={"sign": pl.Enum(["=", "<=", ">="])}
+        )
         short = to_polars(short, schema=schema)
         short = filter_nulls_polars(short)
         check_has_nulls_polars(short, name=f"{self.type} {self.name}")
 
-        df = pl.concat([short, long], how="diagonal").sort(["labels", "rhs"])
+        lf = pl.concat([short, long], how="diagonal").sort(["labels", "rhs"])
         # delete subsequent non-null rhs (happens is all vars per label are -1)
-        is_non_null = df["rhs"].is_not_null()
+        is_non_null = pl.col("rhs").is_not_null()
         prev_non_is_null = is_non_null.shift(1).fill_null(False)
-        df = df.filter(is_non_null & ~prev_non_is_null | ~is_non_null)
-        return df[["labels", "coeffs", "vars", "sign", "rhs"]]
+        lf = lf.filter(is_non_null & ~prev_non_is_null | ~is_non_null)
+        return lf.select(pl.col(["labels", "coeffs", "vars", "sign", "rhs"]))
 
     # Wrapped function which would convert variable to dataarray
     assign = conwrap(Dataset.assign)

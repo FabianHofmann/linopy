@@ -159,7 +159,6 @@ class Variable:
         self._model = model
 
     def __getitem__(self, selector) -> Union["Variable", "ScalarVariable"]:
-
         keys = selector if isinstance(selector, tuple) else (selector,)
         if all(map(pd.api.types.is_scalar, keys)):
             warn(
@@ -799,10 +798,10 @@ class Variable:
         -------
         pl.DataFrame
         """
-        df = to_polars(self.data)
-        df = filter_nulls_polars(df)
-        check_has_nulls_polars(df, name=f"{self.type} {self.name}")
-        return df
+        lf = to_polars(self.data)
+        lf = filter_nulls_polars(lf)
+        check_has_nulls_polars(lf, name=f"{self.type} {self.name}")
+        return lf
 
     def sum(self, dim=None, **kwargs):
         """
@@ -1024,7 +1023,6 @@ class AtIndexer:
         self.object = obj
 
     def __getitem__(self, keys) -> "ScalarVariable":
-
         keys = keys if isinstance(keys, tuple) else (keys,)
         object = self.object
 
